@@ -95,9 +95,13 @@
     </div>
 
     <div id="extractedWrap" class="hidden mt-4">
-      <button id="toggleExtracted" class="text-xs text-blue-600 font-medium hover:underline">추출된 텍스트 미리보기 ▾</button>
-      <textarea id="extractedText" rows="8" readonly
+      <button id="toggleExtracted" class="text-xs text-blue-600 font-medium hover:underline">추출된 텍스트 미리보기 (직접 수정 가능) ▾</button>
+      <textarea id="extractedText" rows="8"
         class="hidden w-full mt-2 text-xs rounded-lg border border-slate-300 p-3 bg-slate-50 text-slate-600"></textarea>
+
+      <div id="chunkPreview" class="mt-3 text-xs bg-blue-50 border border-blue-200 rounded-lg px-3 py-2 text-blue-700">
+        학생 구분 결과가 여기에 표시됩니다.
+      </div>
     </div>
   </section>
 
@@ -162,7 +166,7 @@ toggleSettings.addEventListener('click', () => {
 toggleExtracted.addEventListener('click', () => {
   extractedText.classList.toggle('hidden');
   toggleExtracted.textContent = extractedText.classList.contains('hidden')
-    ? '추출된 텍스트 미리보기 ▾' : '추출된 텍스트 숨기기 ▴';
+    ? '추출된 텍스트 미리보기 (직접 수정 가능) ▾' : '추출된 텍스트 숨기기 ▴';
 });
 
 // ---------- 토스트 ----------
@@ -243,6 +247,7 @@ extractBtn.addEventListener('click', async () => {
     extractedWrap.classList.remove('hidden');
     enableBtn(extractBtn, true);
     enableBtn(runBtn, false);
+    computeAndShowChunks();
     showToast('텍스트 추출이 완료되었습니다!', 'success');
   } catch (err) {
     console.error(err);
@@ -253,15 +258,86 @@ extractBtn.addEventListener('click', async () => {
   }
 });
 
-// ---------- 2. 에이전트 실행 ----------
+// 텍스트를 직접 수정하면 학생 구분을 다시 계산
+extractedText.addEventListener('input', () => {
+  extractedFullText = extractedText.value;
+  computeAndShowChunks();
+});
+
+// ---------- 학생 단위로 텍스트 분할 ----------
+// "번호 + 한글 이름"이 1,2,3... 순서대로 등장하는 패턴을 학생 구분 기준으로 사용
+function splitStudents(text) {
+  if (!text) return [];
+  const regex = /(\d{1,3})\s{1,15}([가-힣]{2,6})\s/g;
+  let match;
+  const matches = [];
+  while ((match = regex.exec(text)) !== null) {
+    matches.push({ number: parseInt(match[1], 10), name: match[2], index: match.index });
+  }
+  let expected = 1;
+  const filtered = [];
+  for (const m of matches) {
+    if (m.number === expected) {
+      filtered.push(m);
+      expected++;
+    }
+  }
+  if (filtered.length < 2) return [];
+  const chunks = [];
+  for (let i = 0; i < filtered.length; i++) {
+    const start = filtered[i].index;
+    const end = i + 1 < filtered.length ? filtered[i + 1].index : text.length;
+    chunks.push({ number: filtered[i].number, name: filtered[i].name, text: text.slice(start, end).trim() });
+  }
+  return chunks;
+}
+
+let currentChunks = [];
+const chunkPreview = document.getElementById('chunkPreview');
+
+function computeAndShowChunks() {
+  currentChunks = splitStudents(extractedFullText);
+  if (currentChunks.length >= 2) {
+    const names = currentChunks.map(c => `${c.number}. ${c.name}`).join(' · ');
+    chunkPreview.className = 'mt-3 text-xs bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 text-emerald-700';
+    chunkPreview.textContent = `✅ 학생 ${currentChunks.length}명 감지됨 → ${names}  (에이전트를 학생별로 ${currentChunks.length}번 호출합니다)`;
+  } else {
+    chunkPreview.className = 'mt-3 text-xs bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-amber-700';
+    chunkPreview.textContent = '⚠️ 학생별 구분에 실패했습니다. 전체 텍스트를 하나로 묶어 한 번만 처리합니다. (텍스트를 직접 수정해 "번호 이름" 형식을 다듬으면 다시 감지됩니다)';
+  }
+}
+
+// ---------- 에이전트 한 번 호출 ----------
+async function runOneAgentCall(baseUrl, agentId, userInput, activity) {
+  const sessionRes = await fetch(`${baseUrl}/sessions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agentId })
+  });
+  if (!sessionRes.ok) throw new Error(`세션 생성 실패 (HTTP ${sessionRes.status})`);
+  const sessionData = await sessionRes.json();
+  const sessionId = sessionData.sessionId;
+  if (!sessionId) throw new Error('세션 ID를 받지 못했습니다.');
+
+  const runRes = await fetch(`${baseUrl}/agents/run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ sessionId, query: { userInput, activity } })
+  });
+  if (!runRes.ok) throw new Error(`에이전트 실행 실패 (HTTP ${runRes.status})`);
+  return await runRes.json();
+}
+
+// ---------- 2. 에이전트 실행 (학생별 순차 호출) ----------
 runBtn.addEventListener('click', async () => {
-  if (!extractedFullText) {
+  const sourceText = extractedText.value.trim();
+  if (!sourceText) {
     showToast('먼저 PDF 텍스트를 추출해주세요.', 'error');
     return;
   }
   const agentId = document.getElementById('agentId').value.trim();
   const baseUrlRaw = document.getElementById('baseUrl').value.trim();
-  const activity = document.getElementById('activityInput').value.trim();
+  const activity = document.getElementById('activityInput').value.trim() || "학생 관찰 기록 기반 세특 생성";
 
   if (!agentId || !baseUrlRaw) {
     showToast('에이전트 ID와 서버 주소를 입력해주세요.', 'error');
@@ -269,70 +345,86 @@ runBtn.addEventListener('click', async () => {
   }
 
   const baseUrl = baseUrlRaw.replace(/\/+$/, '');
+
+  // 항상 최신 텍스트로 재분할 후 실행
+  let chunks = splitStudents(sourceText);
+  if (chunks.length < 2) {
+    chunks = [{ number: 1, name: '전체 학생', text: sourceText }];
+  }
+
   disableBtn(runBtn);
   disableBtn(extractBtn);
-  setStatus(true, '에이전트 세션을 생성하는 중입니다...');
+  studentRecords = [];
+  hasScrolledToResults = false;
+  let successCount = 0;
+  let failCount = 0;
 
-  try {
-    // 1) 세션 생성
-    const sessionRes = await fetch(`${baseUrl}/sessions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agentId })
-    });
-    if (!sessionRes.ok) throw new Error(`세션 생성 실패 (HTTP ${sessionRes.status})`);
-    const sessionData = await sessionRes.json();
-    const sessionId = sessionData.sessionId;
-    if (!sessionId) throw new Error('세션 ID를 받지 못했습니다.');
-
-    // 2) 에이전트 실행
-    setStatus(true, '에이전트가 세특을 생성하는 중입니다... (내용에 따라 시간이 걸릴 수 있어요)');
-    const runRes = await fetch(`${baseUrl}/agents/run`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sessionId,
-        query: {
-          userInput: extractedFullText,
-          activity: activity || "학생 관찰 기록 기반 세특 생성"
-        }
-      })
-    });
-    if (!runRes.ok) throw new Error(`에이전트 실행 실패 (HTTP ${runRes.status})`);
-    const runData = await runRes.json();
-
-    const records = extractRecords(runData);
-    if (records.length === 0) {
-      console.warn('알 수 없는 응답 형식:', runData);
-      showToast('결과를 해석할 수 없어요. 콘솔(F12)에서 응답을 확인해주세요.', 'error');
-      setStatus(false);
-      enableBtn(extractBtn, true);
-      enableBtn(runBtn, false);
-      return;
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    setStatus(true, `${i + 1}/${chunks.length}번째 학생(${chunk.name}) 세특 생성 중...`);
+    try {
+      const runData = await runOneAgentCall(baseUrl, agentId, chunk.text, activity);
+      const records = extractRecords(runData);
+      if (records.length === 0) {
+        console.warn('알 수 없는 응답 형식:', runData);
+        studentRecords.push({ name: `${chunk.name} (해석 실패)`, subject: '', text: '⚠️ 에이전트 응답을 해석하지 못했습니다. 콘솔(F12)에서 응답 구조를 확인해주세요.' });
+        failCount++;
+      } else {
+        records.forEach(r => studentRecords.push(normalizeRecord(r)));
+        successCount += records.length;
+      }
+    } catch (err) {
+      console.error(err);
+      studentRecords.push({ name: `${chunk.name} (오류)`, subject: '', text: `⚠️ 처리 중 오류가 발생했습니다: ${err.message}` });
+      failCount++;
     }
-
-    studentRecords = records.map(r => normalizeRecord(r));
     renderResults(studentRecords);
-    showToast(`${studentRecords.length}명의 세특이 생성되었습니다!`, 'success');
-  } catch (err) {
-    console.error(err);
-    showToast(err.message || '에이전트 실행 중 오류가 발생했습니다.', 'error');
-  } finally {
-    setStatus(false);
-    enableBtn(extractBtn, true);
-    enableBtn(runBtn, false);
+  }
+
+  setStatus(false);
+  enableBtn(extractBtn, true);
+  enableBtn(runBtn, false);
+
+  if (failCount === 0) {
+    showToast(`${successCount}명의 세특이 모두 생성되었습니다!`, 'success');
+  } else {
+    showToast(`${successCount}명 성공, ${failCount}건 실패했습니다. 결과를 확인해주세요.`, 'error');
   }
 });
 
 // ---------- 응답 파싱 ----------
-function extractRecords(data) {
-  if (!data) return [];
-  if (Array.isArray(data)) return data;
-  if (Array.isArray(data.records)) return data.records;
-  if (Array.isArray(data.record)) return data.record;
-  if (data.record && typeof data.record === 'object') return [data.record];
+function extractRecords(data, depth) {
+  depth = depth || 0;
+  if (!data || typeof data !== 'object' || depth > 6) return [];
+
+  // 배열 자체가 학생 레코드 배열인 경우
+  if (Array.isArray(data)) {
+    if (data.length && data[0] && typeof data[0] === 'object' && data[0].student_name) return data;
+    return [];
+  }
+
+  // 흔한 위치들 우선 확인: record / records (최상위 또는 params 하위)
+  const direct = [data.record, data.records];
+  const nested = data.params ? [data.params.record, data.params.records] : [];
+  const candidates = direct.concat(nested);
+
+  for (const c of candidates) {
+    if (!c) continue;
+    if (Array.isArray(c) && c.length) return c;
+    if (typeof c === 'object' && c.student_name) return [c];
+  }
+
   if (data.student_name) return [data];
-  if (data.data) return extractRecords(data.data);
+
+  // 위에서 못 찾으면 하위 객체들을 재귀적으로 탐색 (내부 메타데이터 키는 제외)
+  for (const key of Object.keys(data)) {
+    if (key.startsWith('_') || key === 'messages') continue;
+    const val = data[key];
+    if (val && typeof val === 'object') {
+      const found = extractRecords(val, depth + 1);
+      if (found.length) return found;
+    }
+  }
   return [];
 }
 
@@ -356,6 +448,7 @@ function normalizeRecord(r) {
 }
 
 // ---------- 결과 렌더링 ----------
+let hasScrolledToResults = false;
 function renderResults(records) {
   resultsList.innerHTML = '';
   records.forEach((rec, idx) => {
@@ -379,7 +472,10 @@ function renderResults(records) {
     resultsList.appendChild(card);
   });
   resultsSection.classList.remove('hidden');
-  resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  if (!hasScrolledToResults) {
+    resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    hasScrolledToResults = true;
+  }
 
   document.querySelectorAll('.copyOneBtn').forEach(btn => {
     btn.addEventListener('click', () => {
